@@ -222,7 +222,10 @@ def replace_module(model: AutoModelForCausalLM, name: str, new_module: torch.nn.
         child_name = name
     setattr(parent, child_name, new_module)
 
-
+# 量化weight的过程:
+# 1. 找出模型中的所有linear
+# 2. 调用per_tensor_quantize量化除了LMhead外的linear的weight
+# 3. 使用FP8DynamicLinear替换掉该fp16或者bf16类型的linear
 def quantize_weights(
     model: AutoModelForCausalLM,
     quantize_config: BaseQuantizeConfig,
@@ -245,7 +248,13 @@ def quantize_weights(
         del linear
     cleanup_memory()
 
-
+# 量化activation:
+# 1. 如果是静态量化，才走这一步，动态量化在quantize_weight后已经结束
+# 2. FP8StaticLinearQuantizer替换掉model中的所有(经quantize_weight而得的)FP8DynamicLinear
+# 3. model(calibration_tokens[row_idx].reshape(1, -1))一行做calibration，具体是：当calibration推理过程来到每个FP8StaticLinearQuantizer时，即调用FP8StaticLinearQuantizer的forward方法，forward方法的152-157行
+计算出activation input的scale，158-165调用fp8_gemm(torch.scaled_mm)完成fp8 gemm输出本linear的结果，送往后面的算子做推理。168-174求出activation output的scale，作为kv cache的scale
+可以看到calibration的作用为求出所有linear的input和output的scale
+# 4. 298-305行把上一步求出的scale全部赋给FP8StaticLinear的input_scale和output_scale成员，fp8模型跑起来的时候，将会直接调用这些scale乘上输入输出完成量化，在我们的项目里面，这一步由vllm完成，vllm会读取fp8模型里面的各个linear的scale，然后做类似于FP8StaticLinear的事情
 def quantize_activations(
     model: AutoModelForCausalLM,
     quantize_config: BaseQuantizeConfig,
